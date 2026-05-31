@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+airflow_home/
+logs/
+*.db
+.env
+.pytest_cache/
+.DS_Store
+.coverage
+htmlcov/
+dist/
+*.egg-info/
