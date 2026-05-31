@@ -130,6 +130,8 @@ open http://localhost:8080
 
 The DAG graph and task logs are visible at `http://localhost:8080`.
 
+![Homer Daily Sync DAG graph — all six tasks succeeded](docs/graph.png)
+
 ---
 
 ## Testing
