@@ -19,8 +19,9 @@ from airflow.decorators import dag, task
 from airflow.models import TaskInstance
 
 from pipeline.deduplicator import deduplicate
-from pipeline.loader import load
+from pipeline.loader import load, load_bigquery
 from pipeline.models import (
+    BigQueryLoaderStats,
     DedupedListing,
     NormalizedListing,
     RawListing,
@@ -48,16 +49,19 @@ DEFAULT_ARGS: dict = {
 DAG_DOC: str = """
 ## Homer Daily Sync
 
-**Purpose:** Ingest property listings from Yad2 and Facebook Marketplace into
-Firestore every night at 23:00 UTC.
+**Purpose:** Ingest property listings from Yad2 and Facebook Marketplace,
+clean and deduplicate them, then fan-out to two sinks every night at 23:00 UTC:
+
+- **Firestore** — operational CRM database
+- **BigQuery** — analytical data warehouse (homer_analytics.listings)
 
 ### Pipeline Architecture
 ```
 ┌─────────────┐ ──┐
 │ scrape_yad2 │   │
-└─────────────┘   ├──► normalize ──► validate ──► deduplicate ──► load
-┌──────────────┐  │
-│ scrape_fb    │ ──┘
+└─────────────┘   ├──► normalize ──► validate ──► deduplicate ─┬─► load_firestore
+┌──────────────┐  │                                            └─► load_bigquery
+│ scrape_fb    │ ─┘
 └──────────────┘
 ```
 
@@ -69,15 +73,18 @@ Firestore every night at 23:00 UTC.
 | normalize | Cleans prices, rooms notation, Hebrew text |
 | validate | Spam filter + ±3σ outlier detection per deal_type |
 | deduplicate | MD5 fingerprint deduplication (price rounded to 100K) |
-| load | Batch writes to Firestore (400 docs/batch) |
+| load_firestore | Batch writes to Firestore (400 docs/batch) |
+| load_bigquery | Streams rows to BigQuery (homer_analytics.listings) |
 
 ### Data Flow (XCom)
 Each task pushes its result dict to XCom under the key `return_value`.
 The next task pulls and deserialises before processing.
+After `deduplicate`, both loader tasks receive the same XCom value (fan-out).
 
 ### Links
 - [Apify Yad2 Actor](https://apify.com/actors)
 - [Firestore Batch Writes](https://firebase.google.com/docs/firestore/manage-data/transactions)
+- [BigQuery Load Jobs](https://cloud.google.com/bigquery/docs/loading-data)
 """
 
 
@@ -87,11 +94,11 @@ The next task pulls and deserialises before processing.
 
 @dag(
     dag_id="homer_daily_sync",
-    description="Daily ETL: Yad2 + Facebook → Firestore",
+    description="Daily ETL: Yad2 + Facebook → Firestore + BigQuery",
     schedule="0 23 * * *",
     start_date=datetime(2024, 1, 1),
     catchup=False,
-    tags=["homer", "etl", "portfolio"],
+    tags=["homer", "etl", "portfolio", "bigquery"],
     default_args=DEFAULT_ARGS,
     doc_md=DAG_DOC,
 )
@@ -203,9 +210,9 @@ def homer_daily_sync() -> None:
         return dict(stats)
 
     # -----------------------------------------------------------------------
-    # Task 5: Load
+    # Task 5a: Load → Firestore
     # -----------------------------------------------------------------------
-    @task(task_id="load")
+    @task(task_id="load_firestore")
     def task_load(dedup_result: dict) -> dict:
         """
         Load unique listings into Firestore.
@@ -219,7 +226,7 @@ def homer_daily_sync() -> None:
         listings: list[DedupedListing] = dedup_result["listings"]
         stats = load(listings)
         logger.info(
-            "task_load | loaded=%d batches=%d duration=%.2fs",
+            "task_load_firestore | loaded=%d batches=%d duration=%.2fs",
             stats["total_loaded"],
             stats["batch_count"],
             stats["duration_seconds"],
@@ -227,8 +234,47 @@ def homer_daily_sync() -> None:
         return dict(stats)
 
     # -----------------------------------------------------------------------
+    # Task 5b: Load → BigQuery  (parallel with Firestore — fan-out)
+    # -----------------------------------------------------------------------
+    @task(task_id="load_bigquery")
+    def task_load_bigquery(dedup_result: dict) -> dict:
+        """
+        Sync unique listings to Google BigQuery for analytical queries.
+
+        Runs in parallel with ``load_firestore`` after the deduplicate step
+        (fan-out pattern).  Both tasks receive the same XCom payload so neither
+        waits for the other.
+
+        In this portfolio project the BigQuery call is mocked.  To activate
+        production mode set the following environment variables before starting
+        the Airflow scheduler::
+
+            export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
+            export BQ_PROJECT_ID="your-gcp-project"
+            export BQ_DATASET_ID="homer_analytics"
+            export BQ_TABLE_ID="listings"
+
+        Args:
+            dedup_result: XCom value from task_deduplicate.
+
+        Returns:
+            BigQueryLoaderStats dict.
+        """
+        listings: list[DedupedListing] = dedup_result["listings"]
+        stats: BigQueryLoaderStats = load_bigquery(listings)
+        logger.info(
+            "task_load_bigquery | rows=%d table=%s duration=%.2fs",
+            stats["rows_inserted"],
+            stats["table_id"],
+            stats["duration_seconds"],
+        )
+        return dict(stats)
+
+    # -----------------------------------------------------------------------
     # Wire up dependencies
-    # [scrape_yad2, scrape_facebook] >> normalize >> validate >> deduplicate >> load
+    # [scrape_yad2, scrape_facebook] >> normalize >> validate >> deduplicate
+    #                                                                  ├──► load_firestore
+    #                                                                  └──► load_bigquery
     # -----------------------------------------------------------------------
     yad2_result = task_scrape_yad2()
     fb_result = task_scrape_facebook()
@@ -236,6 +282,7 @@ def homer_daily_sync() -> None:
     validate_result = task_validate(normalize_result)
     dedup_result = task_deduplicate(validate_result)
     task_load(dedup_result)
+    task_load_bigquery(dedup_result)
 
 
 # Instantiate the DAG

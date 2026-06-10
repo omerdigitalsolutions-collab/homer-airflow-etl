@@ -3,6 +3,11 @@ Data models for the Homer ETL pipeline.
 
 Defines TypedDict schemas for property listings and pipeline statistics.
 All pipeline modules share these definitions for type consistency.
+
+Loader stats
+------------
+- LoaderStats        — Firestore batch loader
+- BigQueryLoaderStats — BigQuery sync loader
 """
 
 from __future__ import annotations
@@ -114,8 +119,17 @@ class DeduplicatorStats(TypedDict):
 
 
 class LoaderStats(TypedDict):
-    """XCom payload produced by the loader task."""
+    """XCom payload produced by the Firestore loader task."""
 
     total_loaded: int
     batch_count: int
+    duration_seconds: float
+
+
+class BigQueryLoaderStats(TypedDict):
+    """XCom payload produced by the BigQuery loader task."""
+
+    total_loaded: int
+    rows_inserted: int
+    table_id: str
     duration_seconds: float

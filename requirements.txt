@@ -1,6 +1,11 @@
 # ── Runtime ──────────────────────────────────────────────────────────────────
 apache-airflow==2.10.3
 
+# ── BigQuery (production) ─────────────────────────────────────────────────────
+# Uncomment to activate real BigQuery writes.  Also set:
+#   GOOGLE_APPLICATION_CREDENTIALS, BQ_PROJECT_ID, BQ_DATASET_ID, BQ_TABLE_ID
+# google-cloud-bigquery>=3.11.0
+
 # ── Dev / Test ────────────────────────────────────────────────────────────────
 pytest==8.3.3
 pytest-cov==5.0.0

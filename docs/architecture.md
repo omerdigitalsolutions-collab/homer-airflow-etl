@@ -13,8 +13,8 @@ Firebase Cloud Functions) using mock data from two simulated scrapers.
 ```
 ┌─────────────┐ ──┐
 │ scrape_yad2 │   │
-└─────────────┘   ├──► normalize ──► validate ──► deduplicate ──► load
-┌──────────────┐  │
+└─────────────┘   ├──► normalize ──► validate ──► deduplicate ──┬──► load_firestore
+┌──────────────┐  │                                              └──► load_bigquery
 │ scrape_fb    │ ──┘
 └──────────────┘
 ```
@@ -120,9 +120,9 @@ neighbourhood names vary between sources (e.g. "נווה צדק" vs "נווה-צ
 
 ---
 
-### Stage 5 — Loading
+### Stage 5a — Firestore Loader
 
-**Module:** `pipeline/loader.py`
+**Module:** `pipeline/loader.py` → `load()`
 
 Writes deduplicated listings to Firestore in batches of **400**.
 
@@ -136,6 +136,42 @@ round-trip latency of ~50–100 ms.  Writing 500 documents one by one would take
 
 ---
 
+### Stage 5b — BigQuery Loader (Fan-out, parallel with Firestore)
+
+**Module:** `pipeline/loader.py` → `load_bigquery()`
+
+Runs **concurrently** with the Firestore loader after `deduplicate`.
+Both tasks receive the same XCom payload from `deduplicate` — neither waits
+for the other (Airflow fan-out pattern).
+
+**Purpose:** Export the cleaned, deduplicated listings to
+`homer_analytics.listings` in Google BigQuery so that analysts can run
+arbitrary SQL (Window Functions, CTEs, GROUP BY) and connect BI tools
+(e.g. Power BI, Looker Studio).
+
+**Mock vs production:**
+
+| | Mock (portfolio) | Production |
+|--|---|---|
+| Implementation | `time.sleep()` simulates latency | `google.cloud.bigquery.Client.load_table_from_json()` |
+| Credentials | none required | `GOOGLE_APPLICATION_CREDENTIALS` env var |
+| `table_id` | `homer-portfolio.homer_analytics.listings` (env-configurable) | your GCP project |
+| Write mode | — | `WRITE_APPEND` (new rows daily) |
+
+**Configuring for production** (env vars):
+
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
+export BQ_PROJECT_ID="your-gcp-project"
+export BQ_DATASET_ID="homer_analytics"   # default
+export BQ_TABLE_ID="listings"            # default
+```
+
+Then uncomment `google-cloud-bigquery>=3.11.0` in `requirements.txt` and
+replace the mock block in `load_bigquery()` with the SDK snippet in its docstring.
+
+---
+
 ## XCom Data Flow
 
 Airflow's XCom mechanism serialises task return values to the metadata database
@@ -143,12 +179,17 @@ and makes them available to downstream tasks.  Every task in this DAG returns
 a plain `dict` (JSON-serialisable) containing:
 
 ```
-scrape_*   →  { source, count, listings: [...] }
-normalize  →  { input_count, output_count, listings: [...] }
-validate   →  { input_count, valid_count, rejected_count, listings: [...], rejected: [...] }
-deduplicate→  { input_count, unique_count, duplicate_count, listings: [...] }
-load       →  { total_loaded, batch_count, duration_seconds }
+scrape_*       →  { source, count, listings: [...] }
+normalize      →  { input_count, output_count, listings: [...] }
+validate       →  { input_count, valid_count, rejected_count, listings: [...], rejected: [...] }
+deduplicate    →  { input_count, unique_count, duplicate_count, listings: [...] }
+load_firestore →  { total_loaded, batch_count, duration_seconds }
+load_bigquery  →  { total_loaded, rows_inserted, table_id, duration_seconds }
 ```
+
+After `deduplicate`, both loader tasks read the **same XCom value** independently
+(fan-out).  Airflow passes the serialised dict to each loader without copying
+it — both tasks pull from the same XCom key.
 
 ---
 
@@ -201,6 +242,10 @@ The real Homer pipeline runs on **Firebase Cloud Functions** triggered by
 Firestore events.  To adapt this DAG for production:
 
 1. Replace `scrape_yad2()` / `scrape_facebook()` with Apify Actor calls.
-2. Replace the mock `_write_batch()` in `loader.py` with `db.batch().commit()`.
-3. Set `AIRFLOW_HOME` to a persistent location.
-4. Store the Firebase service account key in Airflow Connections (not in code).
+2. Replace the mock `_write_batch()` in `loader.py` with `db.batch().commit()`
+   (Firestore `firebase_admin` SDK).
+3. Uncomment `google-cloud-bigquery` in `requirements.txt` and replace the
+   mock block in `load_bigquery()` with the `google.cloud.bigquery` SDK calls
+   (full snippet in the function docstring).
+4. Set `AIRFLOW_HOME` to a persistent location.
+5. Store service-account keys in Airflow Connections / Secret Manager— never in code.
